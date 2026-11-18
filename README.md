@@ -25,28 +25,39 @@ is dominated by the size of hour 1: across the 37 usable comparables,
 18–24. Huge hour-1 launches stay flat with a mild US-evening rise; tiny
 hour-1 launches (unlock later in the day) explode later, up to 1000×.
 
-Each hour's quantiles blend two estimates in log space (0.7 / 0.3):
+Each hour's quantiles blend two estimates in log space (0.5 / 0.5):
 
 1. **Kernel-weighted empirical quantiles** of `log r_h` — Gaussian kernel on
    `log viewers(1)` (bandwidth 1.0), so a huge hour 1 borrows its shape from
    the biggest past launches (ELDEN RING, Cyberpunk 2077, Diablo IV…).
    Launches whose unlock type differs (rolling midnight local vs one
-   simultaneous global unlock) get weight ×0.36.
-2. **Per-hour OLS** of `log r_h` on `log viewers(1)` (clipped to the donors'
-   range, so nothing extrapolates past the biggest launch) with Gaussian
-   residual quantiles.
+   simultaneous global unlock) get weight ×0.14.
+2. **Per-hour QUADRATIC OLS** of `log r_h` on `log viewers(1)` (centred,
+   with a squared term — the log_v1 → shape curve bends) with Gaussian
+   residual quantiles, clipped to the donors' range so nothing extrapolates
+   past the biggest launch.
 
-If a case can't be forecast from its comparables, it falls back to the
-house baseline (persistence + 0.15/√h random walk) instead of crashing.
+The blended deviation from the median is scaled by 0.9 and the whole curve
+shifted up by +0.05 log units (the LOO median is biased low; a +0.05 shift
+minimises pinball loss). If a case can't be forecast from its comparables,
+it falls back to the house baseline (persistence + 0.15/√h random walk)
+instead of crashing.
 
 ## Validation (leave-one-out on the 37 kit comparables, same pinball loss
 on the log scale as the grader)
 
 | model | mean loss | big hour-1 (≥40k) |
 |---|---|---|
-| this entry | **0.396** | **0.250** |
+| this entry (v2, quadratic OLS + tuned blend/shift) | **0.383** | **~0.24** |
+| v1 (linear OLS, 0.7/0.3 blend) | 0.396 | 0.250 |
 | house baseline | 0.930 | 0.295 |
 | unconditional empirical quantiles | 0.715 | 0.373 |
+
+Tuning notes: a full grid search over bandwidth / blend weight / roll
+penalty / spread / shift found the shipped config (bw 1.0, kernel 0.5,
+roll 0.5, spread 0.9, shift +0.05). A PCA functional model (0.509) and
+pre-launch history features (residual corr −0.12…−0.27) did not help and
+were not used. Live practice rank before v2: 5066/8,256 (loss 0.222).
 
 Also verified: output format on all 4 practice cases (strict checker:
 exactly one `hours` key, 23 rows, hours 2–24, 5 finite quantiles each in
