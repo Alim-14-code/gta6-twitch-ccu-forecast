@@ -21,18 +21,24 @@ So each hour's quantiles are estimated two ways and blended in log space:
      borrows its shape from the biggest past launches (ELDEN RING,
      Cyberpunk 2077, Diablo IV, ...). Launches whose unlock type differs
      (rolling midnight local vs one simultaneous global unlock) get their
-     weight multiplied by exp(-0.5 * (1/0.7)^2) ~= 0.36.
-  2. A per-hour OLS of log r_h on log viewers(1) (log viewers(1) clipped
-     to the training range, so nothing extrapolates linearly past the
-     biggest launch) with Gaussian residual quantiles.
-Blend: 0.7 * kernel + 0.3 * OLS, in log space. Quantiles are then
+     weight multiplied by exp(-0.5 * (1/0.5)^2) ~= 0.14.
+  2. A per-hour QUADRATIC OLS of log r_h on log viewers(1) (centred, with
+     a squared term: the log_v1 -> shape curve bends, and a line leaves a
+     systematic residual) with Gaussian residual quantiles. log viewers(1)
+     is clipped to the training range, so nothing extrapolates past the
+     biggest launch.
+Blend: 0.5 * kernel + 0.5 * quadratic-OLS, in log space. The blended
+deviation from the median is scaled by 0.9 and the whole curve shifted up
+by +0.05 log units (the LOO median is biased low by ~0.15; a +0.05 shift
+minimises pinball loss after the spread is set). Quantiles are then
 viewers(1) * exp(blended log-quantile), rounded half-up to 2 decimals.
 
 Leave-one-out cross-validation on the 37 kit comparables (mean pinball
-loss on the log scale, same rule as the grader): this model 0.396, house
+loss on the log scale, same rule as the grader): this model 0.383, house
 baseline (persistence + 0.15/sqrt-h random walk) 0.930, unconditional
-empirical quantiles 0.715. On the big hour-1 launches (viewers(1) >=
-40,000, the regime GTA VI will be in) it scores 0.25 vs 0.30 baseline.
+empirical quantiles 0.715, the previous linear-OLS version 0.396. On the
+big hour-1 launches (viewers(1) >= 40,000, the regime GTA VI will be in)
+it scores about 0.24 vs 0.30 baseline.
 
 The program reads every <id>.in in $MAKEFUN_INPUT_DIR (else /input) and
 writes <id>.out to $MAKEFUN_OUTPUT_DIR (else /output). No network, no
@@ -64,9 +70,13 @@ Z = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.644853
 # Gaussian kernel bandwidth on log viewers(1), in log units.
 KERNEL_BW = 1.0
 # Penalty bandwidth for a launch whose unlock type differs from the target's.
-ROLL_BW = 0.7
+ROLL_BW = 0.5
 # Blend weight of the kernel estimate (rest is the OLS estimate), in log space.
-KERNEL_WEIGHT = 0.7
+KERNEL_WEIGHT = 0.5
+# The blended deviation from the median is scaled by this (spread calibration).
+SPREAD = 0.9
+# Uniform upward shift applied to every blended log-quantile (bias correction).
+SHIFT = 0.05
 # Spread of the house baseline's random walk, in log units per sqrt hour.
 BASE_SIGMA = 0.15
 
@@ -186,29 +196,49 @@ def kernel_quantiles(launches: list[dict], log_v1: float, target_rolling: bool, 
     return [weighted_quantile(pairs, tau) for tau in LEVELS]
 
 
+def _solve3(a: list[list[float]], b: list[float]) -> list[float]:
+    """Solve a 3x3 linear system by Gaussian elimination with pivoting."""
+    m = [a[i][:] + [b[i]] for i in range(3)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(m[r][col]))
+        m[col], m[piv] = m[piv], m[col]
+        pv = m[col][col]
+        if abs(pv) < 1e-12:
+            continue
+        for r in range(3):
+            if r != col:
+                f = m[r][col] / pv
+                for cc in range(col, 4):
+                    m[r][cc] -= f * m[col][cc]
+    return [m[i][3] / m[i][i] if abs(m[i][i]) > 1e-12 else 0.0 for i in range(3)]
+
+
 def ols_quantiles(launches: list[dict], log_v1: float, hour: int) -> list[float]:
-    """Per-hour OLS of log r_h on log viewers(1), with Gaussian residual
-    quantiles. log viewers(1) is clipped to the donors' range, so the
-    fitted line never extrapolates past the biggest past launch."""
+    """Per-hour QUADRATIC OLS of log r_h on log viewers(1), with Gaussian
+    residual quantiles. The log_v1 -> shape curve bends (a line leaves a
+    systematic residual), so the design is [1, x - mean_x, (x - mean_x)^2].
+    log viewers(1) is clipped to the donors' range, so the fitted curve
+    never extrapolates past the biggest past launch."""
     xs = []
     ys = []
     for launch in launches:
         if hour in launch["log_ratio"]:
             xs.append(launch["log_v1"])
             ys.append(launch["log_ratio"][hour])
-    if len(xs) < 3:
+    if len(xs) < 5:
         raise ValueError(f"too few donor launches for hour {hour}")
-    n = len(xs)
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    sxx = sum((x - mean_x) ** 2 for x in xs)
-    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    slope = sxy / sxx if sxx > 0 else 0.0
-    intercept = mean_y - slope * mean_x
-    residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    mean_x = sum(xs) / len(xs)
+    rows = [[1.0, x - mean_x, (x - mean_x) ** 2] for x in xs]
+    p = 3
+    xtx = [[sum(r[a] * r[b] for r in rows) for b in range(p)] for a in range(p)]
+    xty = [sum(r[a] * y for r, y in zip(rows, ys)) for a in range(p)]
+    beta = _solve3(xtx, xty)
+    residuals = [y - sum(b * v for b, v in zip(beta, r)) for r, y in zip(rows, ys)]
     sd = statistics.pstdev(residuals) if len(residuals) > 1 else 0.3
-    clipped = min(max(log_v1, min(xs)), max(xs))
-    centre = intercept + slope * clipped
+    lo = min(x - mean_x for x in xs)
+    hi = max(x - mean_x for x in xs)
+    xc = min(max(log_v1 - mean_x, lo), hi)
+    centre = beta[0] + beta[1] * xc + beta[2] * xc * xc
     return [centre + z * sd for z in Z]
 
 
@@ -238,6 +268,9 @@ def forecast_case(case: dict, name: str) -> dict:
         blended = [
             KERNEL_WEIGHT * k + (1.0 - KERNEL_WEIGHT) * o for k, o in zip(kernel, ols)
         ]
+        # Spread calibration + bias correction (tuned by LOO on the donors).
+        med = blended[2]
+        blended = [med + (b - med) * SPREAD + SHIFT for b in blended]
         quantiles = [round2(p1 * math.exp(value)) for value in blended]
         # Repair any rounding inversion and keep every quantile in (0, 1e9].
         fixed = []
